@@ -47,7 +47,11 @@
 #define RX_PIN 5
 #define TX_PIN 4 
 
+// CTS signal pin
+#define CTS_PIN 14
 
+// mode switch
+#define MODE_PIN 13
 
 //#define LED_PIN 2
 #define LED_PIN 10
@@ -72,11 +76,16 @@ void GoTheFuckToSleep();
 ATScanner SoftATscanner(SoftSerial, GoTheFuckToSleep);
 
 
+#define READ_BUFFER_SIZE 254    
+byte read_buff[READ_BUFFER_SIZE+2];
 
 // global objects
 WiFiEventHandler gotIpEventHandler, disconnectedEventHandler;
 WiFiServer server(RAW_TCP_PORT);
 WiFiClient  client;
+
+// serial baudrate (grobal)
+int Baud;
 
 void checkFlash(){
 #ifdef DEBUG
@@ -323,6 +332,46 @@ void CheckPrgButton(){
     } else {                    // wasPressed flag was already set
       //not really doing anything here...
     }
+
+    ////////////////////////////////////////////////
+    // Press 'Prog button' to inform the local IP.
+    ////////////////////////////////////////////////
+    int cnt = 0;
+    while ( digitalRead(PRG_PIN)==LOW) {
+        //LED ON
+        digitalWrite(LED_PIN, LEDON);
+        delay(10); // Delay for Button ON
+        // 1 sec pressed ?
+        if ( cnt++ > 100 ){
+            char sbuff[64];
+            uint32_t v4 = WiFi.localIP().v4();
+            char * pv4 = (char *)&v4;
+            sprintf(sbuff,"1 WiFi connect\r\n2 IP:%d.%d.%d.%d\r\n",pv4[0],pv4[1],pv4[2],pv4[3]);
+            //change 1920bps -> 9600bps
+            if ( Baud==SOFTBAUDRATE5 ) {
+                SoftSerial.end();
+                SoftSerial.begin(SOFTBAUDRATE4);
+            }
+            //IP address send to G850V
+            SoftSerial.write(sbuff);
+            SoftSerial.flush();
+            // restart SoftwareSerial driver
+            if ( Baud==SOFTBAUDRATE5 ) {
+                SoftSerial.end();
+                SoftSerial.begin(SOFTBAUDRATE5);
+            }
+            //finished
+            digitalWrite(LED_PIN, LEDOFF);
+            for ( cnt=0  ;cnt < 5 ; cnt++){
+                digitalWrite(LED_PIN, LEDON);
+                delay(100);
+                digitalWrite(LED_PIN, LEDOFF);
+                delay(100);
+            }
+            break;
+        }
+    }
+
   } else{ //button not pressed
     if(wasPressed==true){   // but it was pressed just a moment ago
       wasPressed= false;    // let's reset that memory
@@ -350,9 +399,46 @@ void CheckPrgButton(){
 }
 
 
+/***************************************************************/
+/*   GetLine : Get Line                                        */
+/*   処理    : ソースバッファから１行分の文字列を取得する      */
+/*   出力    : バイト数                                        */
+/***************************************************************/
+int GetLine( byte *dst_buff ,byte *src_buff ,int size )
+{
+int	sts;
+int	i;
+int	cnt=0;
+	/* 読出しバッファ上限まで */
+	size = (size >= READ_BUFFER_SIZE ) ? READ_BUFFER_SIZE : size;
+	/* 1行終了まで取り出す */
+	for( i = 0 ; i < size ; i++ ){
+		/* 1文字取り出し */
+		sts = *src_buff++;
+
+		switch ( sts ){
+		case '\n':
+		case 0x1a:
+			*dst_buff++ = (char)sts;
+			cnt++;
+			/* ファイル終了 */
+			return cnt;
+		default:
+			*dst_buff++ = (char)sts;
+			cnt++;
+			break;
+		}
+	}
+	return cnt;
+}
+
+
 
 
 void setup() {
+
+  wifi_set_sleep_type(LIGHT_SLEEP_T);
+
   #ifdef DEBUG
     Serial.begin(9600);
   #endif
@@ -380,7 +466,21 @@ void setup() {
   SetBlinker(On);
   BlinkTimer.start();  
 
-  SoftSerial.begin(GlobalConfig.softbaudrate);
+  pinMode(CTS_PIN, INPUT);	//CTS signal pin
+  pinMode(MODE_PIN, INPUT);	//mode switch
+
+  //Check Mode switch
+  if (digitalRead(MODE_PIN)==LOW){
+    // 19200Bps
+    SoftSerial.begin(SOFTBAUDRATE5);
+    Baud = SOFTBAUDRATE5;
+  }
+  else{
+    // user setting
+    SoftSerial.begin(GlobalConfig.softbaudrate);
+    //現在のボーレートを保存する
+    Baud = GlobalConfig.softbaudrate;
+  }
 
   //WiFi stuff:
   WiFi.begin(GlobalConfig.wifissid, GlobalConfig.wifipassword);
@@ -438,8 +538,25 @@ void loop() {
             size = (size >= BUFFER_SIZE ? BUFFER_SIZE : size);
             client.read(buff, size);
             netscanner.scan(buff, size);
-            SoftSerial.write(buff, size);
-            SoftSerial.flush();
+
+            int index=0;
+            while (size > 0) {
+                /* 1行分のデータを取り出す */
+                int cnt = GetLine( read_buff , &buff[index] , size );
+                /* 1行分のデータを送付してWAITする */
+                SoftSerial.write(read_buff, cnt);
+                SoftSerial.flush();
+                while(digitalRead(CTS_PIN)==LOW){
+                  //19200Bps時はCTS制御しない
+                  if (digitalRead(MODE_PIN)==LOW){
+                     break;
+                  }
+                  delay(1); // Wait for CTS=HIGH.
+                }
+                /* 次回サイズ更新 */
+                size -= cnt;
+                index += cnt;
+            }
             SleepTimerRestart();
             BlinkTimer.update();
       }
@@ -459,6 +576,39 @@ void loop() {
       BlinkTimer.update();
       ArduinoOTA.handle();
       CheckPrgButton();
+
+      //Mode switch = LOW
+      int chg_baud = 0;
+      if (digitalRead(MODE_PIN)==LOW){
+      	if(Baud != SOFTBAUDRATE5){
+      		SoftSerial.end();
+      		// Set to 19200Bps
+      		Baud = SOFTBAUDRATE5;
+      		SoftSerial.begin(Baud);
+      		chg_baud = 1;
+      	}
+      }
+      //Mode switch = Hi
+      else{
+      	if(Baud != GlobalConfig.softbaudrate){
+      		SoftSerial.end();
+      		// Set to default
+      		Baud = GlobalConfig.softbaudrate;
+      		SoftSerial.begin(Baud);
+      		chg_baud = 1;
+      	}
+      }
+      //baudrate is changed?
+      if(chg_baud){
+      	digitalWrite(LED_PIN, LEDOFF);
+      	for ( int cnt=0  ;cnt < 5 ; cnt++){
+      		digitalWrite(LED_PIN, LEDON);
+      		delay(100);
+      		digitalWrite(LED_PIN, LEDOFF);
+      		delay(100);
+      	}
+      }
+
     }
 
     client.stop();    

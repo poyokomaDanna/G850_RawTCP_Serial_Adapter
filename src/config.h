@@ -29,7 +29,7 @@
 #define SOFTBAUDRATE2 2400
 #define SOFTBAUDRATE3 4800
 #define SOFTBAUDRATE4 9600
-
+#define SOFTBAUDRATE5 19200
 
 
 // Our configuration structure.
